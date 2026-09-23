@@ -330,9 +330,36 @@
             .filter(Boolean)
             .map((t) => `<span class="xf-dataline${scanError && t === scanError ? ' xf-dataline-bad' : ''}">${esc(t)}</span>`)
             .join('')}
+          ${coverageText()}
         </div>
         ${right}
       </div>`;
+  }
+
+  /**
+   * 角标覆盖率:**本页多少帖、标了几个**。
+   *
+   * 为什么要有这一行(两份外部方案都强调):角标是"只标有证据的人"的功能,
+   * 覆盖率天然不满。没有这一行,用户会把"没角标"读成"已关注" —— 那是错误信息。
+   * 只在页面上真有帖子时才显示,免得在名单页占地方。
+   */
+  function coverageText() {
+    let arts;
+    try {
+      arts = document.querySelectorAll('article[data-testid="tweet"]');
+    } catch {
+      return '';
+    }
+    if (!arts.length) return '';
+    let marked = 0;
+    for (const a of arts) {
+      try {
+        if (a.querySelector('.xf-uw')) marked += 1;
+      } catch {
+        /* ignore */
+      }
+    }
+    return `<span class="xf-dataline">角标:本页 ${arts.length} 帖 · 标出 ${marked} 人(只标明确读到"未关注"的)</span>`;
   }
 
   function renderRow(r, tab) {
@@ -430,12 +457,10 @@
       footHtml(ignored)
     );
   }
-
   function footHtml(ignored) {
     if (!ignored) return '';
     return `<div class="xf-foot"><button class="xf-link" data-act="show-ignored">已忽略 ${ignored} 人</button></div>`;
   }
-
   function render() {
     try {
       renderInner();

@@ -24,6 +24,8 @@
   const CHANNEL = '__xf_payload__';
   const OPS_CHANNEL = '__xf_ops__';
   const NAV_CHANNEL = '__xf_nav__';
+  // 时间线/评论区里"每个作者和我是什么关系" —— 角标的数据通路。
+  const AUTHORS_CHANNEL = '__xf_authors__';
   const MAX_BODY = 12 * 1024 * 1024;
 
   // 精确匹配,不用宽泛的子串。
@@ -40,6 +42,19 @@
     'UserFollowers',
   ]);
   const LIST_11 = /\/1\.1\/(friends|followers)\/list\.json$/i;
+  // 时间线 / 详情页(评论区)。**单独一类,永远不进名单** ——
+  // 「不要用宽泛子串匹配」那条规矩的原因就是它:HomeTimeline 里也有一堆 user 对象,
+  // 收进来名单就乱了。所以这里给的是**第三种类型**(timeline),不是把它当 following。
+  //
+  // 分类它只为一件事:量一下这些响应里到底带不带"我是否关注了他"。
+  // 如果带,时间线和评论区就能自动给每个帖子的作者打角标;不带,那条路直接判死,
+  // 不用再猜。带着 type 走,下面的 bridge 会明确拒绝把它当名单 ingest。
+  const TIMELINE_OPS = new Set([
+    'HomeTimeline',
+    'HomeLatestTimeline',
+    'TweetDetail',
+    'SearchTimeline',
+  ]);
   // 关注 / 取关。这两个**不是**我们要采集的名单,但它们的响应里有"目标是谁" ——
   // 页面自己发这两个请求的唯一时机,就是用户在 X 界面上点了关注或取关。
   // 顺手读一下,名单就能立刻反映真实状态:你点完回来,那一行自己就消失了。
@@ -75,6 +90,8 @@
     if (op && LIST_OPS.has(op)) {
       return /Followers/i.test(op) && !/Following/i.test(op) ? 'followers' : 'following';
     }
+    // 时间线 / 详情页:单独一类,只为量字段(见 TIMELINE_OPS 的注释)。**它不是名单。**
+    if (op && TIMELINE_OPS.has(op)) return 'timeline';
     return null;
   }
 
@@ -116,6 +133,79 @@
   function emitStatusOnly(url, status) {
     post({ [CHANNEL]: 1, url: String(url), status, body: '', listType: null });
   }
+
+  /**
+   * 把响应里"每个带关系数据的用户"抽成 `{id, sn, f, fb, bv}`。
+   * 这是角标的**数据来源**。
+   *
+   * **必须靠解析,不能靠"回看一段文本"** —— 我先写的就是回看窗口,测试当场抓到串人:
+   * 对象里塞了填充之后,窗口够不到它自己的身份,于是抽到的是上一个人的 handle。
+   * 把甲的状态安到乙头上,比不显示严重得多(用户会去取关一个其实关注着的人)。
+   * 解析之后身份就是同一个对象自己的字段,结构上不可能串。
+   *
+   * ⚠ 仍然是探测级:字段优先级这里只做最小版;生产要走 `extract.js` 那套
+   *   带身份边界和四级来源优先级的 walker(那是四次真机故障换来的)。
+   */
+  function authorsOf(text, limit) {
+    if (text.length > 2 * 1024 * 1024) return []; // 太大的响应不解析,探测不值得
+    let root;
+    try {
+      root = JSON.parse(text);
+    } catch {
+      return [];
+    }
+    const out = [];
+    const seen = new Set();
+    const str = (o, ...keys) => {
+      for (const k of keys) if (typeof o[k] === 'string' && o[k]) return o[k];
+      return '';
+    };
+    (function walk(node, depth) {
+      if (out.length >= limit || !node || typeof node !== 'object' || depth > 24) return;
+      if (Array.isArray(node)) {
+        for (const it of node) {
+          if (out.length >= limit) return;
+          walk(it, depth + 1);
+        }
+        return;
+      }
+      const rp = node.relationship_perspectives;
+      if (rp && typeof rp === 'object') {
+        const core = node.core || {};
+        const legacy = node.legacy || {};
+        const id = str(node, 'rest_id', 'id_str');
+        const sn =
+          str(core, 'screen_name') || str(legacy, 'screen_name') || str(node, 'screen_name');
+        if ((id || sn) && !seen.has(id || sn)) {
+          seen.add(id || sn);
+          out.push({
+            id,
+            sn,
+            f: typeof rp.following === 'boolean' ? rp.following : null,
+            fb: typeof rp.followed_by === 'boolean' ? rp.followed_by : null,
+            bv: typeof node.is_blue_verified === 'boolean' ? node.is_blue_verified : null,
+          });
+        }
+      }
+      for (const k of Object.keys(node)) {
+        if (out.length >= limit) return;
+        walk(node[k], depth + 1);
+      }
+    })(root, 0);
+    return out;
+  }
+
+  /**
+   * 时间线/详情页响应的入口:每份都抽一次作者和关系(角标要覆盖用户滚到的每一段)。
+   * 抽出来的是**最小投影**(谁、我是否关注他、他是否关注我、蓝V),几 MB 的原文不出页面。
+   */
+  function onTimeline(url, text) {
+    const authors = authorsOf(text, 200);
+    if (authors.length) {
+      post({ [AUTHORS_CHANNEL]: 1, op: opNameOf(url), url: String(url), at: Date.now(), authors });
+    }
+  }
+
 
   // ── 主路径:XMLHttpRequest ─────────────────────────────────
   // X 的前端用 XHR 而不是 fetch(上一轮实测:抓到的接口 URL 全带 xhr 前缀,
@@ -162,6 +252,22 @@
         if (status >= 400) emitStatusOnly(req.url, status);
         return;
       }
+      if (req.listType === 'timeline') {
+        // 只把抽取出来的最小投影发出去,响应原文不出页面
+        try {
+          const rt = xhr.responseType;
+          const text =
+            rt === '' || rt === 'text'
+              ? xhr.responseText
+              : rt === 'json'
+                ? JSON.stringify(xhr.response)
+                : '';
+          if (text) onTimeline(req.url, text);
+        } catch {
+          /* responseText 在非文本 responseType 下会抛,忽略 */
+        }
+        return;
+      }
       try {
         let text = '';
         const rt = xhr.responseType;
@@ -202,7 +308,7 @@
             res
               .clone()
               .text()
-              .then((t) => emit(url, res.status, t, lt))
+              .then((t) => (lt === 'timeline' ? onTimeline(url, t) : emit(url, res.status, t, lt)))
               .catch(() => {});
           } catch {
             /* ignore */

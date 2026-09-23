@@ -701,6 +701,18 @@
       return;
     }
 
+    if (data.__xf_authors__) {
+      // 时间线/评论区里"每个作者和我是什么关系" —— 角标的数据来源。
+      //
+      // ⚠ 存进**独立命名空间**,永不进账本。理由不是风格偏好,是机制:
+      // 账本的 resolveFact 是"最新观测胜出",而时间线观测的时间戳几乎总比上一次扫描新 ——
+      // 一旦写成 obs.iFollow.timeline,`iFollow===true` 会被翻成 false,
+      // **人会掉出未回关名单**(那个判定同时要求 followingFresh,但那只挡加人不挡踢人)。
+      // 分成两个键,最坏的结果只是角标错;混在一起,角标错会经名单流向取关动作。
+      absorbAuthors(data);
+      return;
+    }
+
     if (!data.__xf_payload__) return;
     // ⚠ 这道守卫必须放行 follow / unfollow。
     //
@@ -713,6 +725,39 @@
     const pass = lt === 'following' || lt === 'followers' || lt === 'follow' || lt === 'unfollow' || lt == null;
     if (!pass) return;
     ingest(data);
+  }
+
+  const AUTHOR_KEY = 'xf:authorfacts';
+  const AUTHOR_MAX = 4000;
+
+  /**
+   * 把一份响应里抽到的作者事实并进本地缓存。
+   * 只做"合并 + 上限",不做任何判定 —— 判定在显示层(角标模块)。
+   */
+  function absorbAuthors(msg) {
+    if (!chromeAlive() || !chrome.storage || !chrome.storage.local) return;
+    chrome.storage.local.get([AUTHOR_KEY], (r) => {
+      const prev = (r && r[AUTHOR_KEY]) || null;
+      const me = detectSelfHandle() || '';
+      // 换账号(或身份刚确认成另一个)⇒ 旧事实全错,整份作废,不拿它当据
+      const base = prev && prev.handle && me && prev.handle !== me ? null : prev;
+      const cur = base && base.byId ? base : { handle: me, byId: {} };
+      const at = Date.now();
+      for (const a of msg.authors || []) {
+        const key = a.id || a.sn;
+        if (!key) continue;
+        cur.byId[key] = { f: a.f, fb: a.fb, bv: a.bv, sn: a.sn || '', at };
+      }
+      cur.at = at;
+      if (!cur.handle) cur.handle = me;
+      const keys = Object.keys(cur.byId);
+      if (keys.length > AUTHOR_MAX) {
+        // 按观测时间裁掉最旧的(正常浏览远到不了这个量,纯粹防失控)
+        keys.sort((x, y) => (cur.byId[x].at || 0) - (cur.byId[y].at || 0));
+        for (const k of keys.slice(0, keys.length - AUTHOR_MAX)) delete cur.byId[k];
+      }
+      chrome.storage.local.set({ [AUTHOR_KEY]: cur });
+    });
   }
 
   function install() {
