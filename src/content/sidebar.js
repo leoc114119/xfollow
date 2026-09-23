@@ -344,12 +344,16 @@
    * 只在页面上真有帖子时才显示,免得在名单页占地方。
    */
   function coverageText() {
-    let arts;
+    let all;
     try {
-      arts = document.querySelectorAll('article[data-testid="tweet"]');
+      all = document.querySelectorAll('article[data-testid="tweet"]');
     } catch {
       return '';
     }
+    // **同一条口径**:都是"帖",而且都把嵌套的引用帖排除掉。
+    // 原来分母数的是所有 article、分子却写"人",同一作者发三帖就报三人 ——
+    // 用户会高估覆盖(外部审查 1.8)。
+    const arts = Array.from(all).filter((a) => !(a.parentElement && a.parentElement.closest('article[data-testid="tweet"]')));
     if (!arts.length) return '';
     let marked = 0;
     for (const a of arts) {
@@ -359,7 +363,7 @@
         /* ignore */
       }
     }
-    return `<span class="xf-dataline">角标:本页 ${arts.length} 帖 · 标出 ${marked} 人(只标明确读到"未关注"的)</span>`;
+    return `<span class="xf-dataline">角标:本页 ${arts.length} 帖 · 标出 ${marked} 帖(只标明确读到"未关注"的)</span>`;
   }
 
   function renderRow(r, tab) {

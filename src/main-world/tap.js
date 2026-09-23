@@ -154,17 +154,19 @@
     } catch {
       return [];
     }
-    const out = [];
-    const seen = new Set();
+    // 同一个 id 在一份响应里出现**相反**的值 → 有歧义,这个 id 直接不用(归为未知)。
+    // 之前是"第一个带关系字段的胜出",那等于让响应里的顺序决定给谁打标。
+    const facts = new Map(); // key -> fact
+    const bad = new Set(); // 出现过冲突的 key
     const str = (o, ...keys) => {
       for (const k of keys) if (typeof o[k] === 'string' && o[k]) return o[k];
       return '';
     };
     (function walk(node, depth) {
-      if (out.length >= limit || !node || typeof node !== 'object' || depth > 24) return;
+      if (facts.size >= limit || !node || typeof node !== 'object' || depth > 24) return;
       if (Array.isArray(node)) {
         for (const it of node) {
-          if (out.length >= limit) return;
+          if (facts.size >= limit) return;
           walk(it, depth + 1);
         }
         return;
@@ -176,23 +178,27 @@
         const id = str(node, 'rest_id', 'id_str');
         const sn =
           str(core, 'screen_name') || str(legacy, 'screen_name') || str(node, 'screen_name');
-        if ((id || sn) && !seen.has(id || sn)) {
-          seen.add(id || sn);
-          out.push({
+        const key = id || sn;
+        // 只收有**合法数字 id** 的:身份不稳的事实不敢用(外部审查 1.2)
+        if (id && /^\d+$/.test(id) && !bad.has(key)) {
+          const f = {
             id,
             sn,
             f: typeof rp.following === 'boolean' ? rp.following : null,
             fb: typeof rp.followed_by === 'boolean' ? rp.followed_by : null,
             bv: typeof node.is_blue_verified === 'boolean' ? node.is_blue_verified : null,
-          });
+          };
+          const prev = facts.get(key);
+          if (prev && (prev.f !== f.f || prev.fb !== f.fb)) bad.add(key);
+          else if (!prev) facts.set(key, f);
         }
       }
       for (const k of Object.keys(node)) {
-        if (out.length >= limit) return;
+        if (facts.size >= limit) return;
         walk(node[k], depth + 1);
       }
     })(root, 0);
-    return out;
+    return [...facts.entries()].filter(([k]) => !bad.has(k)).map(([, v]) => v);
   }
 
   /**
@@ -253,7 +259,9 @@
         return;
       }
       if (req.listType === 'timeline') {
-        // 只把抽取出来的最小投影发出去,响应原文不出页面
+        // 只把抽取出来的最小投影发出去,响应原文不出页面。
+        // **非 2xx 不抽**:错误响应里可能只有残缺的用户对象(外部审查 2.3)
+        if (status < 200 || status >= 300) return;
         try {
           const rt = xhr.responseType;
           const text =

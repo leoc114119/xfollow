@@ -26,19 +26,42 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   const FACTS_KEY = 'xf:authorfacts';
   const CLS = 'xf-uw';
-  const MARK_FOR = 'data-xf-uw-for'; // 上次处理时这条帖子的作者键
   const STYLE_ID = 'xf-badge-style';
-  const PER_FRAME = 25; // 每帧最多处理多少条候选
+  const PER_FRAME = 25; // 每帧最多**处理**多少条(已就位的不占这个额度,见 sweep)
   const BUDGET_MS = 4; // 每帧时间预算,超了就留给下一帧
+  // 负事实的有效期:过期按未知处理。
+  // 为什么需要(外部审查指出):用户在**手机或别的浏览器**上关注了某人时,本扩展看不到
+  // 那条动作,旧事实会一直说"你没关注他"。有效期只能降低这种误报,做不到实时同步 ——
+  // 所以文案不宣称"当前",只保证是"近期观察到的"。
+  const FRESH_MS = 6 * 60 * 60 * 1000;
 
   let store = null; // 落盘的原样:{ handle, byId: { [id]: {f,fb,bv,sn,at} } }
   let bySn = {}; // 内存派生索引:handle(小写) -> fact(带 id)。不落盘,避免两份索引不一致
-  let state = null; // 账本状态(只读,用于裁决)
+  let state = null; // 账本状态(只读)。**null = 读不到 → 一律沉默**(fail closed)
   let obs = null;
+  let obsTarget = null;
   let raf = false;
   let started = false;
+  let cursor = 0; // 跨帧游标:上一帧扫到哪了。列表变化/切前台时归零
+  // article -> { key, node|null }:这条帖子处理过谁、我们插了哪个节点。
+  // **用 WeakMap 而不是往 X 的节点上写属性** —— 不变式 3 是"只新增自己的 span"。
+  const seen = new WeakMap();
 
   const ns = () => (typeof globalThis !== 'undefined' && globalThis.XF) || {};
+
+  /**
+   * 当前登录账号的 handle。拿不到就是空 —— **空即未知,未知不显示**。
+   * 为什么必须比:缓存里可能装着**上一个账号**的负事实,拿它给新账号打标就是误标。
+   */
+  function currentHandle() {
+    const B = ns();
+    if (!B || typeof B.identity !== 'function') return '';
+    try {
+      return (B.identity() || {}).handle || '';
+    } catch {
+      return '';
+    }
+  }
 
   // ── 作者身份 ────────────────────────────────────────────────
   /**
@@ -73,10 +96,21 @@
     store = next || null;
     bySn = {};
     if (!store || !store.byId) return;
+    const dup = new Set();
     for (const id of Object.keys(store.byId)) {
       const f = store.byId[id];
-      if (f && f.sn) bySn[String(f.sn).toLowerCase()] = Object.assign({ id }, f);
+      // **必须有合法数字 id**:handle 会改名、会被重新占用,身份不稳的事实不敢用
+      if (!f || !f.sn || !/^\d+$/.test(String(id))) continue;
+      const k = String(f.sn).toLowerCase();
+      // 同一个 handle 对上两个 id = 有歧义 → 两个都不用(归为未知,不是"未关注")。
+      // 不这么做的话,Object.keys 的顺序就会决定给谁打标。
+      if (bySn[k]) {
+        dup.add(k);
+        continue;
+      }
+      bySn[k] = Object.assign({ id: String(id) }, f);
     }
+    for (const k of dup) delete bySn[k];
   }
 
   /**
@@ -131,7 +165,9 @@
       const v = o[src];
       if (v && typeof v.at === 'number' && (!newest || v.at > newest.at)) newest = v;
     }
-    return !!(newest && newest.v === true && newest.at > (fact.at || 0));
+    // 同时刻也算账本胜:两边都是 Date.now() 毫秒,同毫秒不是不可能,
+    // 而一条可信的 true 不该被等时的 false 压掉。
+    return !!(newest && newest.v === true && newest.at >= (fact.at || 0));
   }
 
   /**
@@ -139,11 +175,18 @@
    * 顺序即优先级:任何一条不满足就沉默。
    */
   function verdictFor(key) {
+    const me = currentHandle();
+    // 账号对不上(或身份未知)就沉默:缓存可能属于上一个账号
+    if (!me || !store || !store.handle || store.handle !== me) return '';
+    // 账本读不到 → 白名单和"刚在我们这儿关注过"都无从判断,宁可少标
+    if (!state) return '';
     const f = factFor(key);
     if (!f) return ''; // 没有事实
     if (f.f !== false) return ''; // 不是"明确未关注"
-    if (f.id && state && state.whitelist && state.whitelist[f.id]) return ''; // 忽略过的人不标
-    if (ledgerOverrides(f)) return ''; // 账本里有更新的"已关注"
+    if (!f.id || !/^\d+$/.test(String(f.id))) return ''; // 身份不稳,不判
+    if (!f.at || Date.now() - f.at > FRESH_MS) return ''; // 过期即沉默
+    if (state.whitelist && state.whitelist[f.id]) return ''; // 忽略过的人不标
+    if (ledgerOverrides(f)) return ''; // 账本里有不比它旧的"已关注"
     return '未关注';
   }
 
@@ -184,23 +227,45 @@
   }
 
   /** 处理一条帖子:该显示的插上,该消失的摘掉,都不该做就不留痕迹 */
+  /** 把我们自己的节点摘掉,并清掉记忆。**只碰我们自己的东西。** */
+  function dropOwn(article) {
+    const p = seen.get(article);
+    if (p && p.node && p.node.parentNode) p.node.remove();
+    seen.delete(article);
+  }
+
+  /**
+   * 处理一条帖子:该显示的插上,该消失的摘掉。
+   *
+   * **读不到作者、结构不认识、该沉默的 —— 都必须先把旧角标摘掉再返回。**
+   * 虚拟列表会把同一个 article 复用成别人的帖子,让旧结论留在新内容上就是误标
+   * (外部审查抓到的路径:React 分阶段重绘时 User-Name 会先被删掉再插新的)。
+   */
   function applyTo(article, theme) {
-    if (isNested(article)) return;
+    if (isNested(article)) {
+      dropOwn(article);
+      return;
+    }
     const key = authorKeyOf(article);
-    if (!key) return;
+    if (!key) {
+      dropOwn(article); // 作者一时读不到 → 摘掉旧的,绝不留错标
+      return;
+    }
+    const prev = seen.get(article);
     const want = verdictFor(key);
-    const have = article.querySelector('.' + CLS);
     if (!want) {
-      if (have) have.remove();
-      article.setAttribute(MARK_FOR, key);
+      dropOwn(article);
+      seen.set(article, { key, node: null }); // 记下"处理过了",别每帧重算
       return;
     }
-    if (have && article.getAttribute(MARK_FOR) === key) {
+    if (prev && prev.key === key && prev.node && prev.node.parentNode) {
       // 已就位。但主题可能被用户改了 —— 顺手同步,免得旧色一直留在那儿。
-      if (theme && have.getAttribute('data-xf-t') !== theme) have.setAttribute('data-xf-t', theme);
+      if (theme && prev.node.getAttribute('data-xf-t') !== theme) {
+        prev.node.setAttribute('data-xf-t', theme);
+      }
       return;
     }
-    if (have) have.remove();
+    dropOwn(article);
     // 落点:`⋯` 按钮左边。这是用户指的位置(时间戳右边、菜单左边),
     // 而且它一定在头部那一行里,不用去猜 X 的布局层级。
     let caret = null;
@@ -216,29 +281,33 @@
     span.title = titleFor(key);
     span.setAttribute('data-xf-t', theme || pageTheme());
     caret.parentElement.insertBefore(span, caret);
-    article.setAttribute(MARK_FOR, key);
+    seen.set(article, { key, node: span });
   }
 
   function sweep() {
     if (!store || document.hidden) return;
     ensureStyle();
     const theme = pageTheme(); // 每轮读一次,别每条帖子都读
-    let n = 0;
-    const t0 = Date.now();
     let arts;
     try {
       arts = document.querySelectorAll('article[data-testid="tweet"]');
     } catch {
       return;
     }
-    for (const a of arts) {
-      if (n >= PER_FRAME || Date.now() - t0 > BUDGET_MS) {
-        schedule(); // 没做完就下一帧接着做,不阻塞滚动
-        break;
-      }
+    // **跨帧游标**(外部审查抓到的 bug):原来每帧都从第一条开始、前 25 条把额度用光,
+    // 于是第 26 条之后**永远**处理不到 —— 而且每帧还在排队,白烧 CPU。
+    // 现在从上次停下的地方接着扫,列表变化/切前台时游标归零。
+    if (cursor >= arts.length) cursor = 0;
+    const t0 = Date.now();
+    let n = 0;
+    let i = cursor;
+    for (; i < arts.length; i += 1) {
+      if (n >= PER_FRAME || Date.now() - t0 > BUDGET_MS) break;
       n += 1;
-      applyTo(a, theme);
+      applyTo(arts[i], theme);
     }
+    cursor = i;
+    if (i < arts.length) schedule(); // 没走完,下一帧接着
   }
 
   /** 观察器回调只做这一件事:回调 O(1),高频 mutation 也不怕 */
@@ -274,13 +343,18 @@
         state = null;
       }
     }
+    cursor = 0; // 数据变了,从头重扫
+    attach();
     schedule();
   }
 
-  function start() {
-    if (started) return;
-    started = true;
-    refresh();
+  /**
+   * 挂/重挂观察器。
+   * **目标会被 React 整块换掉**(SPA 导航时 primaryColumn 可能被替换),
+   * 那时旧观察器就留在脱离页面的节点上、再也收不到 mutation —— 表现是"角标不再更新"。
+   * 所以每次 refresh 和每轮扫描前都检查一次:目标换了就重挂。
+   */
+  function attach() {
     // 观察范围尽量窄:首选时间线容器,拿不到才退到 body
     let target = null;
     try {
@@ -288,9 +362,35 @@
     } catch {
       target = document.body;
     }
-    if (target && typeof MutationObserver === 'function') {
-      obs = new MutationObserver(schedule); // 回调里只有 schedule,别在这里做任何查询
-      obs.observe(target, { childList: true, subtree: true });
+    if (!target || typeof MutationObserver !== 'function') return;
+    if (obs && obsTarget === target && target.isConnected !== false) return;
+    if (obs) obs.disconnect();
+    obs = new MutationObserver(schedule); // 回调里只有 schedule,别在这里做任何查询
+    obs.observe(target, { childList: true, subtree: true });
+    obsTarget = target;
+  }
+
+  function start() {
+    if (started) return;
+    started = true;
+    refresh();
+    attach();
+    // 从后台切回前台要重扫一次:隐藏期间有意什么都不做,那期间的变化就欠着
+    try {
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+          cursor = 0;
+          schedule();
+        }
+      });
+    } catch {
+      /* ignore */
+    }
+    // 目标被换掉之后,至少导航时再检查一次观察器还在不在
+    try {
+      window.addEventListener('popstate', attach);
+    } catch {
+      /* ignore */
     }
     // 我们自己的写操作会改存储;被动响应(create/destroy)也会 —— 都要重算一次
     try {
@@ -305,6 +405,7 @@
   function stop() {
     if (obs) obs.disconnect();
     obs = null;
+    obsTarget = null;
     started = false;
     for (const el of document.querySelectorAll('.' + CLS)) el.remove();
   }
@@ -326,7 +427,10 @@
       setStore(f);
       state = s;
     },
+    _titleFor: titleFor,
     _applyTo: applyTo,
     _sweep: sweep,
+    _perFrame: PER_FRAME,
+    _freshMs: FRESH_MS,
   };
 });

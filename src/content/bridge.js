@@ -739,14 +739,17 @@
     chrome.storage.local.get([AUTHOR_KEY], (r) => {
       const prev = (r && r[AUTHOR_KEY]) || null;
       const me = detectSelfHandle() || '';
-      // 换账号(或身份刚确认成另一个)⇒ 旧事实全错,整份作废,不拿它当据
-      const base = prev && prev.handle && me && prev.handle !== me ? null : prev;
+      // 知道了当前账号、而缓存写的是别人(包括没写过)⇒ 整份作废。
+      // 不拿旧账号的负事实去标新账号 —— 那是误标(外部审查 1.1)。
+      // me 为空时不动:那是"还不知道",读的那一端会因为归属不明而沉默。
+      const base = me && prev && prev.handle !== me ? null : prev;
       const cur = base && base.byId ? base : { handle: me, byId: {} };
-      const at = Date.now();
+      // 用页面盖的时间戳(晚到的旧响应不该冒充"最新"),缺了才退回本地时钟
+      const at = Number(msg.at) || Date.now();
       for (const a of msg.authors || []) {
-        const key = a.id || a.sn;
-        if (!key) continue;
-        cur.byId[key] = { f: a.f, fb: a.fb, bv: a.bv, sn: a.sn || '', at };
+        // 只收有合法数字 id 的:handle 会改名、会被重新占用(外部审查 1.2)
+        if (!a || !/^\d+$/.test(String(a.id || ''))) continue;
+        cur.byId[String(a.id)] = { f: a.f, fb: a.fb, bv: a.bv, sn: a.sn || '', at };
       }
       cur.at = at;
       if (!cur.handle) cur.handle = me;

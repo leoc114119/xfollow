@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "xfollow - 拒绝渣蓝",
-  "version": "0.6.37",
+  "version": "0.6.38",
   "description": "在你的关注里找出没回关你的、查出谁取关过你。纯本地运行,只读不写,不主动调用 X 接口。",
   "permissions": [
     "storage"
