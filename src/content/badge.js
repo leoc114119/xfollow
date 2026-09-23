@@ -43,6 +43,7 @@
   let raf = false;
   let started = false;
   let cursor = 0; // 跨帧游标:上一帧扫到哪了。列表变化/切前台时归零
+  let onChanged = null; // 存引用:stop() 要能摘掉它,否则反复启停会越积越多
   // article -> { key, node|null }:这条帖子处理过谁、我们插了哪个节点。
   // **用 WeakMap 而不是往 X 的节点上写属性** —— 不变式 3 是"只新增自己的 span"。
   const seen = new WeakMap();
@@ -393,10 +394,11 @@
       /* ignore */
     }
     // 我们自己的写操作会改存储;被动响应(create/destroy)也会 —— 都要重算一次
+    onChanged = (changes) => {
+      if (changes[FACTS_KEY] || changes['xf:relations'] || changes['xf:whitelist']) refresh();
+    };
     try {
-      chrome.storage.onChanged.addListener((changes) => {
-        if (changes[FACTS_KEY] || changes['xf:relations'] || changes['xf:whitelist']) refresh();
-      });
+      chrome.storage.onChanged.addListener(onChanged);
     } catch {
       /* ignore */
     }
@@ -406,6 +408,15 @@
     if (obs) obs.disconnect();
     obs = null;
     obsTarget = null;
+    // 监听也要摘掉 —— 只 disconnect 观察器是不够的(外部审查点名的"死代码陷阱")
+    if (onChanged) {
+      try {
+        chrome.storage.onChanged.removeListener(onChanged);
+      } catch {
+        /* ignore */
+      }
+      onChanged = null;
+    }
     started = false;
     for (const el of document.querySelectorAll('.' + CLS)) el.remove();
   }
@@ -417,9 +428,16 @@
     else start();
   }
 
+  /** 供界面读的健康信号:现在手上有多少位作者的关系事实。
+   *  没有它,"这页没人需要标"和"数据通道死了"在界面上长得一模一样。 */
+  function stats() {
+    return { facts: Object.keys(bySn).length, account: store ? store.handle || '' : '' };
+  }
+
   return {
     start,
     stop,
+    badgeStats: stats,
     // 给测试用的纯函数入口
     _verdictFor: verdictFor,
     _authorKeyOf: authorKeyOf,

@@ -363,7 +363,19 @@
         /* ignore */
       }
     }
-    return `<span class="xf-dataline">角标:本页 ${arts.length} 帖 · 标出 ${marked} 帖(只标明确读到"未关注"的)</span>`;
+    // 顺便报一句"手里有多少作者的关系事实":没有它,"这页没人需要标"和
+    // "数据通道死了"看起来一模一样(探针摘掉之后,这是唯一还留着的仪器)。
+    let got = 0;
+    try {
+      const st = ns().badgeStats && ns().badgeStats();
+      if (st && typeof st.facts === 'number') got = st.facts;
+    } catch {
+      /* ignore */
+    }
+    return (
+      `<span class="xf-dataline">角标:本页 ${arts.length} 帖 · 标出 ${marked} 帖` +
+      `(已读到 ${got} 位作者的关系;只标明确读到"未关注"的)</span>`
+    );
   }
 
   function renderRow(r, tab) {
