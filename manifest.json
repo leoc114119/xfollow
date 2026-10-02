@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "xfollow - 拒绝渣蓝",
-  "version": "0.6.39",
-  "description": "在你的关注里找出没回关你的、查出谁取关过你。纯本地运行,只读不写,不主动调用 X 接口。",
+  "version": "0.6.51",
+  "description": "在你自己登录的 X 页面上,找出没回关你的账号 —— 分层列出、逐个处理,数据只留在本地。",
   "permissions": [
     "storage"
   ],
@@ -46,10 +46,13 @@
         "src/core/ledger.js",
         "src/core/marks.js",
         "src/core/guard.js",
+        "src/core/tailstats.js",
+        "src/content/translate.js",
         "src/content/bridge.js",
         "src/content/scan.js",
         "src/content/sidebar.js",
         "src/content/badge.js",
+        "src/content/tails.js",
         "src/content/worker.js"
       ],
       "run_at": "document_start"

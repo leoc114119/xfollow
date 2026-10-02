@@ -26,6 +26,10 @@
   const NAV_CHANNEL = '__xf_nav__';
   // 时间线/评论区里"每个作者和我是什么关系" —— 角标的数据通路。
   const AUTHORS_CHANNEL = '__xf_authors__';
+  // P0(临时):发帖请求/响应的**结构**样本 —— 只为摸清字段与 id 路径,不碰正文内容
+  const CREATE_SHAPE_CHANNEL = '__xf_createshape__';
+  // 发帖的操作名。**名字要按真实流量核对**(评审提醒:不能凭记忆写死)。
+  const CREATE_OPS = new Set(['CreateTweet', 'CreateNoteTweet']);
   const MAX_BODY = 12 * 1024 * 1024;
 
   // 精确匹配,不用宽泛的子串。
@@ -92,6 +96,8 @@
     }
     // 时间线 / 详情页:单独一类,只为量字段(见 TIMELINE_OPS 的注释)。**它不是名单。**
     if (op && TIMELINE_OPS.has(op)) return 'timeline';
+    // 发帖(含回复):P0 只用来采样结构,不参与名单,也不自己发请求
+    if (op && CREATE_OPS.has(op)) return 'create';
     return null;
   }
 
@@ -242,9 +248,18 @@
   // 也不再包 setRequestHeader 了 —— 没有读者。要加回来时记住:X 的应用
   // 是带着自己算的签名发请求的,这个钩子是唯一能被动拿到它的地方。
 
-  XMLHttpRequest.prototype.send = function () {
+  XMLHttpRequest.prototype.send = function (body) {
     const req = this.__xfReq;
     if (!req) return OrigSend.apply(this, arguments);
+    // P0:发帖请求的正文要留一份(评审指出:原来只挂 loadend、根本没捕获 send 的正文,
+    // 只加个分类名会重演"分类有了、数据收不到")。**只给 create 这一类留**,而且只做结构判断。
+    if (req.listType === 'create') {
+      try {
+        req.body = typeof body === 'string' ? body : '';
+      } catch {
+        req.body = '';
+      }
+    }
     const gen = req.gen;
     const xhr = this;
     // 用 loadend:load / error / abort 之后它都会触发,监听器不会残留。
@@ -256,6 +271,16 @@
       if (!req.listType) {
         // 未分类:只要出错就上报状态码,供熔断判定
         if (status >= 400) emitStatusOnly(req.url, status);
+        return;
+      }
+      if (req.listType === 'create') {
+        // 非 2xx 一律不解析(timeline 那条路早就有这道闸,create 原来漏了 —— 外部评审指出)
+        if (status < 200 || status >= 300) return;
+        try {
+          emitCreateShape(req, status, xhr);
+        } catch {
+          /* ignore */
+        }
         return;
       }
       if (req.listType === 'timeline') {
@@ -290,6 +315,115 @@
     return OrigSend.apply(this, arguments);
   };
 
+  /**
+   * P0:采一份发帖的**结构**样本(评审要的那种:操作名、字段存在性、id 落在哪条路径、errors 有没有)。
+   * **不记录正文** —— 只记录"有没有 reply / 键名叫什么 / id 路径",以及(回复)新帖 id 本身。
+   */
+  /** fetch 兜底那条路拿到的已经是文本,喂同一条解析(外部评审:走 fetch 时计数会静默归零) */
+  function onCreateShape(url, status, text) {
+    if (status < 200 || status >= 300) return;
+    emitCreateShape({ url: String(url), body: '' }, status, { responseType: '', responseText: text });
+  }
+
+  function emitCreateShape(req, status, xhr) {
+    let respText = '';
+    try {
+      const rt = xhr.responseType;
+      respText = rt === '' || rt === 'text' ? xhr.responseText : '';
+    } catch {
+      respText = '';
+    }
+    const body = String(req.body || '');
+    // 请求体通常是 form 编码(variables=…&features=…),所以用**子串**判断键的存在性
+    const reqShape = {
+      len: body.length,
+      hasReply: /(^|&|\{|,)"?reply"?[=:]/.test(body) || body.indexOf('reply') >= 0,
+      hasInReplyToStatusId: body.indexOf('in_reply_to_status_id') >= 0,
+      hasInReplyToTweetId: body.indexOf('in_reply_to_tweet_id') >= 0,
+      // 键名本身:抓一小段**键名候选**列表(不是正文)
+      keyHits: ['tweet_text', 'reply', 'quoted_status_id', 'media_ids', 'attachment_url', 'note_tweet']
+        .filter((k) => body.indexOf(k) >= 0),
+    };
+    let respShape = { parse: 'no-body' };
+    let posts = [];
+    if (respText) {
+      try {
+        const j = JSON.parse(respText);
+        const hasErrors = !!(j && j.errors);
+        respShape = {
+          parse: 'json',
+          hasErrors,
+          dataKeys: j && j.data && typeof j.data === 'object' ? Object.keys(j.data).slice(0, 6) : [],
+        };
+        posts = postsOf(j);
+        respShape.found = posts.length;
+        respShape.flags = posts[0]
+          ? { hasFullText: !!posts[0].text, hasReply: posts[0].isReply, isQuote: posts[0].isQuote }
+          : null;
+      } catch {
+        respShape = { parse: 'not-json', len: respText.length };
+      }
+    }
+    post({
+      [CREATE_SHAPE_CHANNEL]: 1,
+      at: Date.now(),
+      op: opNameOf(req.url),
+      url: String(req.url).slice(0, 120),
+      status,
+      req: reqShape,
+      resp: respShape,
+      // P1 用的东西:**新建的那条回复**(可能 0 条 —— 失败响应、或结构变了)
+      posts,
+    });
+  }
+
+  /**
+   * 从创建响应里认出**新建的帖子** —— 按**结构**找,不写死 `create_tweet` 这个分支名。
+   * 依据是实测样本(2026-09-27,CreateTweet · HTTP 200):
+   *   · 新帖 id:`…tweet_results.result.rest_id`(legacy.id_str 同值)
+   *   · 作者 id:`…result.core.user_results.result.rest_id`
+   *   · 是不是回复:`legacy.in_reply_to_status_id_str` 在不在
+   *   · 正文:`legacy.full_text`
+   * 注意还有**诱饵**:`legacy.entities.user_mentions[0].id_str` 是被 @ 的人,不是新帖 ✗。
+   * 所以判据是"**同时**有 legacy.full_text 与一个 id" —— 这正是帖子本体,而不是里面提到的谁。
+   *
+   * ⚠ **只取 DFS 第一条(cap=1)**:回复里带**引用**时,`quoted_status_result` 里那篇**旧帖**
+   * 结构完全合法 —— 如果自己也早先发过带尾巴的回复,它就会被当成"这次新建的帖子"多算一条
+   *(外部评审已复现:一条响应上报了 ME:NEW1 + ME:OLDQUOTE ✗)。
+   * 新建的那条在结构上**永远最外层**,第一条就是它。
+   * `CreateNoteTweet` 的结果分支与此不同,但**同样满足**这条判据 ⇒ 天然一起覆盖(它我还没有样本)。
+   */
+  function postsOf(root) {
+    const out = [];
+    const seen = new Set();
+    (function walk(node, depth) {
+      if (!node || typeof node !== 'object' || depth > 12 || out.length >= 1) return; // cap=1:只要最外层那条
+      if (Array.isArray(node)) {
+        for (const v of node) walk(v, depth + 1);
+        return;
+      }
+      const lg = node.legacy;
+      if (lg && typeof lg.full_text === 'string') {
+        const id = typeof node.rest_id === 'string' ? node.rest_id : typeof lg.id_str === 'string' ? lg.id_str : '';
+        if (id && !seen.has(id)) {
+          seen.add(id);
+          const core = node.core && node.core.user_results && node.core.user_results.result;
+          out.push({
+            id,
+            actor: core && typeof core.rest_id === 'string' ? core.rest_id : '',
+            isReply: typeof lg.in_reply_to_status_id_str === 'string' ||
+              typeof lg.in_reply_to_status_id === 'string',
+            isQuote: lg.is_quote_status === true,
+            text: lg.full_text, // ⚠ 只用于匹配"含不含某条尾巴",**不落盘、不上传**
+          });
+        }
+      }
+      for (const k of Object.keys(node)) walk(node[k], depth + 1);
+    })(root, 0);
+    return out;
+  }
+
+
   // ── 兜底:fetch ────────────────────────────────────────────
   // 今天用不到,但 X 换实现的那天这就是"工具悄悄失效"和"工具继续工作"的区别。
   const origFetch = window.fetch;
@@ -316,7 +450,7 @@
             res
               .clone()
               .text()
-              .then((t) => (lt === 'timeline' ? onTimeline(url, t) : emit(url, res.status, t, lt)))
+              .then((t) => (lt === 'timeline' ? onTimeline(url, t) : lt === 'create' ? onCreateShape(url, res.status, t) : emit(url, res.status, t, lt)))
               .catch(() => {});
           } catch {
             /* ignore */

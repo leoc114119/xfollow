@@ -42,6 +42,7 @@
     { key: 'fans', label: '回关检测', hint: '关注了你、是蓝V,你还没回关' },
     { key: 'noback', label: '未回关', hint: '你关注了、但没回关你的人(含后来取关你的)' },
     { key: 'sway', label: '渣蓝', hint: '曾经关注过你、后来不关注了' },
+    { key: 'tails', label: '小尾巴', hint: '回帖时用一条结语,并看今天带尾巴发出去了几条' },
   ];
 
   // 每个名单要看哪张列表 —— 决定「扫描」按钮扫的是哪一个
@@ -142,6 +143,39 @@
     state = await ns().loadState();
     if (!state) return;
     rows = ns().buildRows(state);
+    try {
+      const T = ns();
+      if (T && T.get) tails = (await T.get()).list;
+    } catch {
+      /* 读不到就当没存过 */
+    }
+    // P0 探针读数:**不 await** —— 一次存储读不该把整个 reload 卡住(读不到回调就挂住了)
+    try {
+      if (alive() && typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.get(['xf:createShape', 'xf:tailStats'], (x) => {
+          createShape = (x && x['xf:createShape']) || [];
+          const stats = (x && x['xf:tailStats']) || {};
+          const d = new Date();
+          const p2 = (n) => String(n).padStart(2, '0');
+          tailToday = stats[`${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`] || 0;
+          // ⚠ **只改那两个节点,不重绘**:重绘会重建 tailsView,你正在输入框里打的字就没了
+          //(外部评审:进度条刷新频繁,这个坑会被放大)。
+          try {
+            const nEl = rootEl && rootEl.querySelector('.xf-tail-today');
+            if (nEl) nEl.textContent = String(tailToday);
+            const fEl = rootEl && rootEl.querySelector('.xf-goal-fill');
+            if (fEl) {
+              const pct = Math.max(0, Math.min(100, Math.round((tailToday / TAIL_GOAL) * 100)));
+              fEl.style.width = pct + '%';
+            }
+          } catch {
+            /* ignore */
+          }
+        });
+      }
+    } catch {
+      createShape = [];
+    }
     // 上一次扫描的结果。**这一行必须读**:扫描是在页面跳转之后跑的,
     // 那时抽屉已经销毁、通知没人收 —— 少了它,用户就只看到"列表没变",
     // 完全不知道那一次到底跑了没有、抓到了几条。
@@ -441,8 +475,198 @@
     return `${rel}(取关于 ${ymd})`;
   }
 
+  // ── 小尾巴(最多 10 条,回帖时点一下把其中一条放进剪贴板/回复框)──────────
+  // 走剪贴板而不是直接写进回复框:真机量过 —— 直接写只有**第一次**能被 X 接受,
+  // 同一个框里第二次就不认(字被它重绘抹掉),而失败是静默的。真实的 ⌘V 一定进它状态。
+  let tails = [];
+  let showTailEdit = false; // 小尾巴的二级页(编辑)。主视图只看,要改才进去。
+  let tailMsg = '';
+  // 正在输入的草稿**必须存在内存里**。踩过(用户实测:输几个字、还没点添加就没了):
+  // 面板每 5 秒(以及任何存储变化)会整块重建一次,输入框里的字就是被那一绘冲掉的。
+  let createShape = []; // 探针样本(临时):发帖请求/响应的结构,不含正文
+  let tailToday = 0; // 今天带尾巴发出去了几条
+  // 参考目标:**用户自己定的**(不是 X 的额度,文案不许暗示是)。留成常量,以后要改只动这一处。
+  // 2026-09-28:200 → 100(用户:「任务改成每天 100 吧,200 有点太多了」)。
+  const TAIL_GOAL = 100;
+  let tailDraft = ''; // 新增那一条的草稿
+  const tailEdits = {}; // 已存条目的编辑草稿,按索引
+
+  function tailBarHtml() {
+    const n = tails.length;
+    return (
+      `<div class="xf-tailbar">` +
+      `<button class="xf-link" data-act="tail-copy"${n ? '' : ' disabled'}>${
+        n ? '复制随机一条' : '还没存'
+      }</button>` +
+      `</div>` +
+      // 复制成功/失败**必须在这一行看得见** —— 失败时用户会以为复制好了,
+      // 一粘却是旧内容(外部审查列为最优先的一条)
+      (tailMsg ? `<span class="xf-tail-tip">${esc(tailMsg)}</span>` : '')
+    );
+  }
+
+  /** 现在是不是正在我们自己面板的输入框里打字 */
+  function typingInPanel() {
+    const a = typeof document !== 'undefined' ? document.activeElement : null;
+    // INPUT 和 TEXTAREA 都要认 —— 尾巴的输入框已经换成 textarea(多行),
+    // 只认 INPUT 的话这道保险会**静默失效**(测试当场抓到了)。
+    const tag = a && a.tagName;
+    return !!((tag === 'INPUT' || tag === 'TEXTAREA') && rootEl && rootEl.contains(a));
+  }
+
+  /**
+   * 临时探针的**最小**形态(2026-09-28 整理这页时收成一行)。
+   *
+   * 原来这里是"永远显示最近 2 条样本 + 没样本时也占一行提示",那正是这一页看起来乱的一部分。
+   * 现在只在**看着不对**的时候才出现一行:① 我们没认出这次新建的帖子(found=0 ⇒ 计数可能漏了);
+   * ② 响应带 errors;③ 操作名还不是验证过的那个(CreateNoteTweet 长文至今没样本 ——
+   * 它一出现就顺手留个读数)。样本本身照旧存进 storage,内容一行都不显示。
+   */
+  function tailProbeLine() {
+    const last = createShape[createShape.length - 1];
+    if (!last) return '';
+    const r = last.resp || {};
+    const q = last.req || {};
+    const odd = r.found === 0 || r.hasErrors || String(last.op || '') !== 'CreateTweet';
+    if (!odd) return '';
+    return (
+      `<p class="xf-tail-probe">发帖读数(自查用)· ${esc(last.op || '?')} · HTTP ${esc(String(last.status))}` +
+      ` · 认出帖子 ${esc(String(r.found === undefined ? '?' : r.found))} 条` +
+      ` · 是回复=${q.hasInReplyToTweetId ? '是' : '否'}` +
+      ` · 响应 ${esc(r.parse || '?')}${r.hasErrors ? '(带 errors)' : ''}</p>`
+    );
+  }
+
+  /** 小尾巴那一页的**一行头**:左边"有几条",右边出口。44px,与其它视图的 viewhead 同高,切 tab 不跳 */
+  function tailHeadHtml(right) {
+    return (
+      `<div class="xf-tailhead">` +
+      `<span>我的小尾巴 <b>${tails.length}</b><i>/${ns().CAP || 10}</i></span>` +
+      right +
+      `</div>`
+    );
+  }
+
+  /**
+   * 小尾巴 **主视图**(用户:「编辑收起来,放到一个二级页面」):今天到哪儿了 + 已存的有哪些。
+   * 这一页只管**看和用**,一个字都不编辑 —— 所以没有输入框、没有保存/删除。
+   */
+  function tailsView() {
+    if (showTailEdit) {
+      tProbeRefreshAvail(); // 打开编辑页就顺手读一次可用性(异步,回来只改那一行)
+      return tailEditView();
+    }
+    const n = tailToday;
+    const pct = Math.max(0, Math.min(100, Math.round((n / TAIL_GOAL) * 100)));
+    const probe = tailProbeLine();
+    return (
+      `<div class="xf-goalbox">` +
+      `<div class="xf-goalrow">` +
+      `<span class="xf-goalhead">今日带尾巴回复</span>` +
+      `<span class="xf-goalnum"><b class="xf-tail-today">${n}</b><span> / ${TAIL_GOAL}</span></span>` +
+      `</div>` +
+      `<div class="xf-goal" role="img" aria-label="今日 ${n} / ${TAIL_GOAL}">` +
+      `<span class="xf-goal-fill" style="width:${pct}%"></span></div>` +
+      `<p class="xf-goalnote">回复正文里含一条已存尾巴就算(手打同样一句也算 ✓)。` +
+      `${TAIL_GOAL} 是<em>你自己</em>定的参考目标,不是 X 的额度 ✓</p>` +
+      `</div>` +
+      `<div class="xf-tails">` +
+      tailHeadHtml(
+        `<span class="xf-tailacts">` +
+          `<button class="xf-link" data-act="tail-copy"${tails.length ? '' : ' disabled'}>${
+            tails.length ? '复制随机一条' : '还没存'
+          }</button>` +
+          `<button class="xf-link" data-act="tail-edit">编辑</button>` +
+          `</span>`
+      ) +
+      (tailMsg ? `<p class="xf-tail-msg">${esc(tailMsg)}</p>` : '') +
+      (tails.length
+        ? `<div class="xf-tail-list">` + tails.map((t) => `<p class="xf-tail-item">${esc(t)}</p>`).join('') + `</div>`
+        : `<p class="xf-tail-empty">还没有。点右上角「编辑」写一条,比如「一起进步」。</p>`) +
+      `<p class="xf-tail-help">点回复框旁边的「尾巴」按钮,随机取一条放进剪贴板,你点到回复框末尾 ⌘V 粘上。` +
+      `多存几条轮着用 —— 连着两条一样的结语,正是反垃圾系统盯的重复内容。</p>` +
+      (probe || '') +
+      `</div>`
+    );
+  }
+
+  // ── 翻译探针(P0a,临时;TRANSLATE-DESIGN.md v2 的 P0a)──────────
+  // 只回答两件事:① 隔离世界有没有端侧翻译 API、zh→en 可用性读数(**纯读**:不 create、
+  // 不碰草稿、不需要激活);② 在真实点击手势里,对一句**固定无隐私短句** create+translate
+  // 的用时与成败。读写草稿是 P0b 的事,而且按评审定稿必须在一次性草稿上做 —— 这里绝不碰。
+  let tProbe = { avail: '?', running: false, log: [] };
+
+  function tProbeHtml() {
+    const lines = [`翻译探针(P0a·临时) · zh→en = ${tProbe.avail}`].concat(tProbe.log.slice(-6));
+    return (
+      `<div class="xf-tprobe">` +
+      `<p class="xf-tail-tip xf-tprobe-avail">${esc(lines[0])}</p>` +
+      lines
+        .slice(1)
+        .map((l) => `<p class="xf-tail-tip">${esc(l)}</p>`)
+        .join('') +
+      `<button class="xf-tbtn" data-act="tprobe-run"${tProbe.running ? ' disabled' : ''}>${
+        tProbe.running ? '翻译中…' : '测一次翻译'
+      }</button>` +
+      `</div>`
+    );
+  }
+
+  /** 可用性读数是异步的:渲染时先显示「?」,回来只改那一行(不整块重绘 —— 输入框保护同款) */
+  function tProbeRefreshAvail() {
+    const B = ns();
+    if (tProbe.avail !== '?' || !B || typeof B.availabilityOf !== 'function') return;
+    B.availabilityOf()
+      .then((v) => {
+        tProbe.avail = String(v);
+        const el = rootEl && rootEl.querySelector('.xf-tprobe-avail');
+        if (el) el.textContent = `翻译探针(P0a·临时) · zh→en = ${tProbe.avail}`;
+      })
+      .catch(() => {});
+  }
+
+  function tailEditView() {
+    const cap = ns().CAP || 10;
+    const rowsHtml = tails
+      .map((t, i) => {
+        const v = tailEdits[i] === undefined ? t : tailEdits[i];
+        // 单行尾巴就给一行高 —— 每条都留一行空白,是"没编辑也要占地方"的那种乱
+        const rows = String(v).indexOf('\n') >= 0 ? 2 : 1;
+        return (
+          `<div class="xf-tail-card">
+             <textarea class="xf-tail-in" rows="${rows}" data-tail-i="${i}">${esc(v)}</textarea>
+             <div class="xf-tail-acts">
+               <button class="xf-tbtn" data-act="tail-save" data-tail-i="${i}">保存</button>
+               <button class="xf-tbtn xf-tbtn-danger" data-act="tail-del" data-tail-i="${i}">删除</button>
+             </div>
+           </div>`
+        );
+      })
+      .join('');
+    return (
+      `<div class="xf-tails">` +
+      tailHeadHtml(`<button class="xf-link" data-act="tail-edit-back">← 返回</button>`) +
+      (tailMsg ? `<p class="xf-tail-msg">${esc(tailMsg)}</p>` : '') +
+      (tails.length < cap
+        ? `<div class="xf-tail-add">
+             <textarea class="xf-tail-in" rows="2" data-tail-new="1" placeholder="再写一条…">${esc(tailDraft)}</textarea>
+             <div class="xf-tail-acts">
+               <button class="xf-tbtn xf-tbtn-p" data-act="tail-add">添加</button>
+             </div>
+           </div>`
+        : `<p class="xf-tail-empty">已经存满 ${cap} 条 —— 删一条再加新的。</p>`) +
+      (rowsHtml || `<p class="xf-tail-empty">还没有。在上面写一条,比如「一起进步」。</p>`) +
+      `<p class="xf-tail-help">多存几条轮着用 —— 连着两条一样的结语,正是反垃圾系统盯的重复内容。</p>` +
+      tProbeHtml() +
+      `</div>`
+    );
+  }
+
   function listHtml() {
     const ignored = ignoredRows().length;
+
+    // 第四个 tab 就是小尾巴那一页:它没有"扫描"这回事,数据条也不该出现
+    if (activeTab === 'tails') return tailsView();
 
     if (showIgnored) {
       const list = ignoredRows();
@@ -477,7 +701,9 @@
     if (!ignored) return '';
     return `<div class="xf-foot"><button class="xf-link" data-act="show-ignored">已忽略 ${ignored} 人</button></div>`;
   }
-  function render() {
+  function render(force) {
+    // 正在输尾巴的时候不重绘 —— 重绘会把输入框里的字冲掉(用户实测踩到过)
+    if (!force && typingInPanel()) return;
     try {
       renderInner();
     } catch (e) {
@@ -503,7 +729,7 @@
     const tabsHtml = TABS.map(
       (t) =>
         `<button class="xf-tab${t.key === activeTab ? ' on' : ''}" data-tab="${t.key}" title="${esc(t.hint)}">` +
-        `${esc(t.label)}<i>${c[t.key] || 0}</i></button>`
+        `${esc(t.label)}${t.key === 'tails' ? '' : `<i>${c[t.key] || 0}</i>`}</button>`
     ).join('');
 
     panel.innerHTML =
@@ -513,7 +739,12 @@
       '</div>' +
       `<div class="xf-tabs">${tabsHtml}</div>` +
       `<div class="xf-hint">${esc(cur.hint)}</div>` +
-      scanBarHtml() +
+      (activeTab === 'tails' ? '' : scanBarHtml()) +
+      // 小尾巴单独一行:**不放进数据条** —— 那一行的每一行都是"某张列表扫到什么时候",
+      // 混一个操作行进去就破坏了它的语义(有一条测试正是钉这个的,我一开始就撞上了)。
+      // ⚠ 小尾巴那一页自己有一行头(条数 + 复制),所以这里不再重复渲染一份:原来那一页里
+      // 「复制随机一条」孤零零占一整行,是"乱"的来源之一(2026-09-28 整理)。
+      (activeTab === 'tails' ? '' : tailBarHtml()) +
       (jobMsg ? `<div class="xf-job">${esc(jobMsg)}</div>` : '') +
       `<div class="xf-body">${listHtml()}</div>` +
       // 底部固定:使用反馈请关注作者。它是这个工具唯一的对外链接。
@@ -763,6 +994,13 @@
   // ── 事件:全部委托在根节点上,只绑一次 ────────────────────────
   // 上一版每次重绘都绑一遍,于是监听器越积越多、按钮"越点越多次"。
   function bind() {
+    // 输入时把草稿存进内存:这样即使别处触发了重绘,你输的字也还在
+    rootEl.addEventListener('input', (ev) => {
+      const t = ev.target;
+      if (!t || !t.classList || !t.classList.contains('xf-tail-in')) return;
+      if (t.hasAttribute('data-tail-new')) tailDraft = t.value;
+      else tailEdits[Number(t.dataset.tailI)] = t.value;
+    });
     rootEl.addEventListener('click', (ev) => {
       const t = ev.target;
       if (!t || !t.closest) return;
@@ -790,6 +1028,7 @@
       if (tabBtn) {
         activeTab = tabBtn.dataset.tab;
         showIgnored = false;
+        showTailEdit = false; // 点 tab 总是回到那一页的**主视图**(二级页不保留)
         if (alive() && typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
           chrome.storage.local.set({ [TAB_KEY]: activeTab });
         }
@@ -815,6 +1054,108 @@
       } else if (act === 'show-ignored') {
         showIgnored = true;
         render();
+      } else if (act === 'tail-edit') {
+        // 编辑收进二级页(用户:「也不是经常要新增的」)—— 主视图只管"看"
+        showTailEdit = true;
+        tailMsg = '';
+        render(true);
+      } else if (act === 'tail-edit-back') {
+        showTailEdit = false;
+        tailMsg = '';
+        render(true);
+      } else if (act === 'tprobe-run') {
+        // P0a 的 T4:在**这次真实点击**的手势里 create + translate 一句固定短句。
+        const B = ns();
+        if (!B || typeof B.translateText !== 'function') {
+          tProbe.log = tProbe.log.concat(['翻译模块没加载 —— translate.js 不在 manifest 里?']);
+          render(true);
+          return;
+        }
+        tProbe.running = true;
+        render(true);
+        B.translateText('今天天气不错,我们一起去公园走走吧。')
+          .then((r) => {
+            tProbe.running = false;
+            const at = new Date().toTimeString().slice(0, 8);
+            if (r && r.ok) {
+              tProbe.log = tProbe.log.concat([
+                `${at} · create ${r.msCreate}ms + translate ${r.ms - r.msCreate}ms`,
+                `${at} · 译文「${r.text}」`,
+              ]);
+            } else {
+              tProbe.log = tProbe.log.concat([
+                `${at} · 失败 reason=${(r && r.reason) || '?'}${r && r.error ? ' · ' + r.error : ''}` +
+                  ` · ${(r && r.ms) || 0}ms`,
+              ]);
+            }
+            render(true);
+          })
+          .catch((e) => {
+            tProbe.running = false;
+            tProbe.log = tProbe.log.concat([`探针异常:${(e && e.message) || e}`]);
+            render(true);
+          });
+      } else if (act === 'tail-add') {
+        const input = rootEl.querySelector('[data-tail-new]');
+        const v = input ? input.value : '';
+        if (!v.trim()) {
+          tailMsg = '先写点内容再添加。';
+          render(true);
+          return;
+        }
+        const bad = ns().looksLikeContact ? ns().looksLikeContact(v) : '';
+        if (bad) {
+          // 用户自己定的规矩:不放链接和联系方式(重复内容+链接最招反垃圾)
+          tailMsg = `这条里有${bad} —— 你不放链接和联系方式。去掉再加。`;
+          render(true);
+          return;
+        }
+        tails = ns().sanitize(tails.concat([v]));
+        tailDraft = ''; // 收下了,草稿清空
+        ns().save(tails).then((r) => {
+          tailMsg = r && r.ok ? '已保存。' : `没保存成功(${(r && r.error) || '存储出错'}) —— 请重试。`;
+          render(true);
+        });
+      } else if (act === 'tail-save') {
+        const i = Number(btn.dataset.tailI);
+        const v = tailEdits[i];
+        if (v === undefined) {
+          tailMsg = '没有改动。';
+          render(true);
+          return;
+        }
+        const next = tails.slice();
+        next[i] = v;
+        tails = ns().sanitize(next);
+        delete tailEdits[i];
+        ns().save(tails).then((r) => {
+          tailMsg = r && r.ok ? '已保存。' : `没保存成功(${(r && r.error) || '存储出错'}) —— 请重试。`;
+          render(true);
+        });
+      } else if (act === 'tail-del') {
+        const i = Number(btn.dataset.tailI);
+        tails = tails.filter((_t, j) => j !== i);
+        delete tailEdits[i];
+        ns().save(tails).then((r) => {
+          tailMsg = r && r.ok ? '' : `没保存成功(${(r && r.error) || '存储出错'}) —— 请重试。`;
+          render(true);
+        });
+      } else if (act === 'tail-copy') {
+        // 随机取一条放进剪贴板(避开上一条)。**复制失败要如实说** ——
+        // 不能让你以为粘出来的是尾巴,结果粘出来的是上一次复制的东西。
+        const T = ns();
+        const last = (T.lastCopied && T.lastCopied()) || '';
+        const one = T.pick(tails, last);
+        if (!one) {
+          tailMsg = '还没有尾巴 —— 先点「小尾巴」写一条。';
+          render();
+          return;
+        }
+        T.copyText(one).then((ok) => {
+          tailMsg = ok ? `已复制到剪贴板:${one}` : '复制失败 —— 请手动选中复制。';
+          if (ok) T.remember(one);
+          render(true);
+        });
       } else if (act === 'hide-ignored') {
         showIgnored = false;
         render();
@@ -915,7 +1256,11 @@
     // tabs:透明三等分导航 + 2px 选中线,不再是一排胶囊
     '#xf-sidebar .xf-tabs{display:flex;height:40px;padding:0 16px;flex:none}',
     '#xf-sidebar .xf-tab{flex:1;display:flex;align-items:center;justify-content:center;gap:5px;',
-    '  border:0;background:none;color:var(--xf-secondary);font:600 13px/20px inherit;',
+    // ⚠ 这里原来是 `font:600 13px/20px inherit` —— **非法值**:font 简写里的字体名不能是
+    // `inherit` 这个 CSS-wide 关键字,整条声明会被浏览器丢掉,于是 tab 用回了 UA 的
+    // 表单控件字体(Arial 13.33px),和面板其余部分不是一个字体。拆开写才对。
+    '  border:0;background:none;color:var(--xf-secondary);font-family:inherit;font-size:13px;',
+    '  font-weight:600;line-height:20px;',
     '  padding:0 4px;cursor:pointer;box-shadow:inset 0 -2px 0 transparent;white-space:nowrap}',
     '#xf-sidebar .xf-tab:hover{color:var(--xf-text)}',
     '#xf-sidebar .xf-tab.on{color:var(--xf-text);box-shadow:inset 0 -2px 0 var(--xf-accent)}',
@@ -944,7 +1289,9 @@
     // (面板里的 tabs / 分段控件仍然不是胶囊,免得整页变成一排胶囊。)
     '#xf-sidebar .xf-btn,#xf-sidebar .xf-do,#xf-sidebar .xf-ignore{',
     '  display:inline-flex;align-items:center;justify-content:center;',
-    '  border:1px solid transparent;border-radius:999px;font:700 13px/1 inherit;',
+    // ⚠ 同上:原来是 `font:700 13px/1 inherit`,非法 ⇒ 整条被丢掉,按钮字体也是 UA 默认。
+    '  border:1px solid transparent;border-radius:999px;font-family:inherit;font-size:13px;',
+    '  font-weight:700;line-height:1;',
     '  cursor:pointer;white-space:nowrap;letter-spacing:.2px;',
     '  transition:background-color .15s,color .15s,border-color .15s;}',
     '#xf-sidebar .xf-btn{flex:none;min-width:112px;height:34px;padding:0 18px;',
@@ -1020,6 +1367,59 @@
     '#xf-sidebar .xf-row[data-ign="1"] .xf-av{filter:saturate(.25)}',
     '#xf-sidebar .xf-list-ign .xf-main{border-bottom-color:var(--xf-divider)}',
 
+    // ── 小尾巴这一页(2026-09-28 整理:用户说"太乱了,帮我整理一下,要美观一点")──
+    // 一眼能看懂的层级:目标卡 → 一行头(几条 + 复制)→ 每条一张卡 → 添加卡 → 一行说明。
+    // 原来是 5 段同样字号的灰字 + 两个蓝色文字链接,眼睛没有落点。
+    '#xf-sidebar .xf-goalbox{padding:14px 16px 12px;border-bottom:1px solid var(--xf-divider)}',
+    '#xf-sidebar .xf-goalrow{display:flex;align-items:baseline;justify-content:space-between;gap:12px}',
+    '#xf-sidebar .xf-goalhead{margin:0;font-size:13px;line-height:18px;font-weight:600;color:var(--xf-secondary)}',
+    '#xf-sidebar .xf-goalnum{margin:0;font-size:26px;line-height:30px;font-weight:700;color:var(--xf-text)}',
+    '#xf-sidebar .xf-goalnum span{font-size:14px;font-weight:600;color:var(--xf-muted)}',
+    '#xf-sidebar .xf-goalnote{margin:8px 0 0;font-size:12px;line-height:17px;color:var(--xf-muted)}',
+    '#xf-sidebar .xf-goal{margin:10px 0 0;height:10px;border-radius:999px;background:var(--xf-hover);overflow:hidden}',
+    '#xf-sidebar .xf-goal-fill{display:block;height:100%;background:var(--xf-accent);transition:width .2s}',
+    '#xf-sidebar .xf-tailbar{display:flex;align-items:center;gap:14px;padding:0 16px 10px;flex:none}',
+    '#xf-sidebar .xf-tails{padding:0 16px 14px;display:flex;flex-direction:column;gap:8px}',
+    '#xf-sidebar .xf-tail-tip{margin:0;font-size:12px;line-height:18px;color:var(--xf-secondary)}',
+    // 一行头:左边条数、右边出口。44px 与其它视图的 xf-viewhead 同高,切 tab 时不会跳
+    '#xf-sidebar .xf-tailhead{display:flex;align-items:center;justify-content:space-between;gap:12px;',
+    '  min-height:44px;color:var(--xf-muted);font-size:12px;line-height:18px}',
+    '#xf-sidebar .xf-tailhead b{font-size:13px;font-weight:700;color:var(--xf-text)}',
+    '#xf-sidebar .xf-tailhead i{font-style:normal}',
+    '#xf-sidebar .xf-tailacts{display:flex;align-items:center;gap:12px}',
+    // 主视图的列表**只读**:一条一行,保留换行(尾巴自带排版),不做成输入框
+    '#xf-sidebar .xf-tail-list{display:flex;flex-direction:column;gap:6px}',
+    '#xf-sidebar .xf-tail-item{margin:0;padding:8px 10px;border-radius:10px;background:var(--xf-surface);',
+    '  color:var(--xf-text);font-size:13px;line-height:20px;white-space:pre-wrap;overflow-wrap:anywhere}',
+    '#xf-sidebar .xf-tail-msg{margin:0;font-size:12px;line-height:17px;color:var(--xf-accent)}',
+    '#xf-sidebar .xf-tail-empty{margin:0;padding:6px 0;font-size:12px;line-height:18px;color:var(--xf-muted)}',
+    // 每条一张卡:输入区在上、按钮在下靠右 —— 按钮不再和两行文字抢横向空间
+    '#xf-sidebar .xf-tail-card,#xf-sidebar .xf-tail-add{display:flex;flex-direction:column;gap:4px;',
+    '  padding:6px 8px 6px;border:1px solid var(--xf-divider);border-radius:10px;background:var(--xf-surface)}',
+    '#xf-sidebar .xf-tail-add{border-style:dashed;background:transparent}',
+    '#xf-sidebar .xf-tail-acts{display:flex;justify-content:flex-end;gap:6px}',
+    // 输入框自己不带边框(卡片的框就是它的框),聚焦时才描一圈 —— 一排等宽输入框才齐
+    '#xf-sidebar .xf-tail-in{width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid transparent;',
+    '  border-radius:8px;background:transparent;color:var(--xf-text);resize:vertical;',
+    '  font-family:inherit;font-size:13px;line-height:20px}',
+    '#xf-sidebar .xf-tail-in:focus{outline:none;border-color:var(--xf-control-border);background:var(--xf-bg)}',
+    // 小按钮自成一套(.xf-tbtn):列表行那个 .xf-btn 是 34px 高、min-width 112 的主按钮,
+    // 借用它会把这里撑成一排大胶囊
+    '#xf-sidebar .xf-tbtn{height:26px;padding:0 12px;border:1px solid var(--xf-divider);border-radius:999px;',
+    '  background:transparent;color:var(--xf-secondary);font-family:inherit;font-size:12px;font-weight:600;',
+    '  line-height:1;cursor:pointer}',
+    '#xf-sidebar .xf-tbtn:hover{background:var(--xf-hover);color:var(--xf-text)}',
+    '#xf-sidebar .xf-tbtn-p{border-color:transparent;background:var(--xf-accent);color:#fff}',
+    '#xf-sidebar .xf-tbtn-p:hover{background:var(--xf-accent);color:#fff;border-color:transparent;filter:brightness(1.08)}',
+    '#xf-sidebar .xf-tbtn-danger{color:var(--xf-danger)}',
+    '#xf-sidebar .xf-tbtn-danger:hover{background:var(--xf-danger-bg);color:var(--xf-danger);border-color:transparent}',
+    '#xf-sidebar .xf-tail-help{margin:4px 0 0;font-size:12px;line-height:17px;color:var(--xf-muted)}',
+    '#xf-sidebar .xf-tail-probe{margin:2px 0 0;font-size:11px;line-height:16px;color:var(--xf-muted);',
+    '  overflow-wrap:anywhere}',
+    // 翻译探针(P0a·临时):和正文用一条虚线隔开,一眼能看出"这不是功能,是测量"
+    '#xf-sidebar .xf-tprobe{margin-top:6px;padding:8px 0 0;border-top:1px dashed var(--xf-divider);',
+    '  display:flex;flex-direction:column;align-items:flex-start;gap:4px}',
+    '#xf-sidebar .xf-tbtn:disabled{opacity:.6;cursor:default}',
     '#xf-sidebar .xf-end{padding:14px 16px 4px;text-align:center;font-size:12px;',
     '  line-height:18px;color:var(--xf-muted)}',
     '#xf-sidebar .xf-viewhead,#xf-sidebar .xf-foot{display:flex;align-items:center;',

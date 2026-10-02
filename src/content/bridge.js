@@ -701,6 +701,24 @@
       return;
     }
 
+    if (data.__xf_createshape__) {
+      // P1:只看"是不是回复 + 正文里有没有某条尾巴",命中就把事件交给后台。
+      // ⚠ 正文在这里**用完就丢**:不进 storage、不上传(这里唯一的用途是那次 contains 判断)。
+      confirmTails(data);
+
+      // P0 探针:发帖的结构样本(操作名/字段存在性/id 路径/errors)。**不含正文**。
+      // 只留最近 3 条,量完连同 tap 里那段一起删。
+      if (!chromeAlive() || !chrome.storage || !chrome.storage.local) return;
+      chrome.storage.local.get(['xf:createShape'], (r) => {
+        const prev = (r && r['xf:createShape']) || [];
+        const next = prev
+          .concat([{ at: data.at, op: data.op, status: data.status, req: data.req, resp: data.resp }])
+          .slice(-3);
+        chrome.storage.local.set({ 'xf:createShape': next });
+      });
+      return;
+    }
+
     if (data.__xf_authors__) {
       // 时间线/评论区里"每个作者和我是什么关系" —— 角标的数据来源。
       //
@@ -728,6 +746,49 @@
   }
 
   const AUTHOR_KEY = 'xf:authorfacts';
+  const TAILS_KEY = 'xf:tails';
+
+  /**
+   * P1:把"这条回复带着尾巴发出去了"上报给后台(**唯一写入方**)。
+   * 只上报 (账号, 新帖 id, 事件时间) —— 正文不落盘。
+   */
+  function confirmTails(data) {
+    const posts = Array.isArray(data.posts) ? data.posts : [];
+    if (!posts.length) return;
+    if (!chromeAlive() || !chrome.storage || !chrome.storage.local) return;
+    chrome.storage.local.get([TAILS_KEY], (r) => {
+      const tails = (r && Array.isArray(r[TAILS_KEY]) && r[TAILS_KEY]) || [];
+      if (!tails.length) return;
+      for (const p of posts) {
+        // 只算回复,而且正文里**确实**含某条尾巴(包含规则;手打同样一句也算 —— 口径如此)。
+        //
+        // ⚠ 2026-09-25 试过把这个门槛去掉(理由:按钮已经装到弹窗/发帖框旁边),**当天就退回来了**:
+        // 用户要的是「在引用页不需要小尾巴」,按钮随即收回**只在行内回复框**里出现
+        // (src/content/tails.js 的 REPLY_SEND_SEL)。按钮装在哪里,数字就只算哪里 ——
+        // 两处必须是同一个集合,否则就是"填进去了却不计数"的假一致。
+        if (!p || !p.isReply || !p.id || typeof p.text !== 'string') continue;
+        // X 发布时会**剥掉行首空白**,而尾巴可能以空白/换行开头 ⇒ 直接 indexOf 永远不中
+        //(外部评审指出的少算面)。所以两种形态各比一次。
+        const hit = tails.some((t) => {
+          if (!t) return false;
+          if (p.text.indexOf(t) >= 0) return true;
+          const tr = t.replace(/^\s+/, '');
+          return tr ? p.text.indexOf(tr) >= 0 : false;
+        });
+        if (!hit) continue;
+        try {
+          chrome.runtime.sendMessage({
+            type: 'xf:tailConfirmed',
+            actorId: String(p.actor || ''),
+            postId: String(p.id),
+            at: typeof data.at === 'number' ? data.at : Date.now(),
+          });
+        } catch {
+          /* 后台不在也不影响页面 */
+        }
+      }
+    });
+  }
   const AUTHOR_MAX = 4000;
 
   /**

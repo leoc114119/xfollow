@@ -469,11 +469,67 @@ async function dispatch(tabId) {
   return handOff(id, job);
 }
 
+// ── 「今天带尾巴发出去了几条」的唯一写入方 ────────────────────
+// 为什么必须在 SW 里写:多个内容脚本各自"读—改—写"会丢增量(这个项目在配额上踩过同一类 TOCTOU)。
+// SW 是全浏览器唯一实例,所以互斥放这儿是真的互斥。
+// 语义计算(去重键、事件日、裁剪)在 src/core/tailstats.js 里有**带测试**的一份;
+// 这里只留"若无则加",逻辑面尽量小 —— SW 不能 importScripts(Chrome 对路径解析不一致,
+// 失败会整个 SW 挂掉,这是这个项目踩过的)。
+const TAIL_STATS_KEY = 'xf:tailStats';
+const TAIL_SEEN_KEY = 'xf:tailSeen';
+const TAIL_KEEP_DAYS = 30;
+let tailWriteChain = Promise.resolve(); // 串行化:两次事件不并发读改写
+
+function tailDayKey(ts) {
+  const d = new Date(typeof ts === 'number' ? ts : Date.now());
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function recordTailConfirmed(msg) {
+  return new Promise((resolve) => {
+    const actor = String((msg && msg.actorId) || '');
+    const post = String((msg && msg.postId) || '');
+    const at = msg && typeof msg.at === 'number' && msg.at > 0 ? msg.at : Date.now();
+    if (!actor || !post) return resolve({ counted: false, reason: 'missing-id' });
+    chrome.storage.local.get([TAIL_STATS_KEY, TAIL_SEEN_KEY], (r) => {
+      const stats = Object.assign({}, (r && r[TAIL_STATS_KEY]) || {});
+      const seen = Object.assign({}, (r && r[TAIL_SEEN_KEY]) || {});
+      const key = actor.trim() + ':' + post.trim(); // 与 core 的 seenKeyOf 对齐:两边都 trim
+      if (seen[key]) return resolve({ counted: false, reason: 'already-counted' });
+      seen[key] = at;
+      const day = tailDayKey(at);
+      stats[day] = (stats[day] || 0) + 1;
+      const cutoff = Date.now() - TAIL_KEEP_DAYS * 86400000;
+      for (const d0 of Object.keys(stats)) {
+        const t = new Date(d0 + 'T00:00:00').getTime();
+        if (!isNaN(t) && t < cutoff) delete stats[d0];
+      }
+      for (const k of Object.keys(seen)) if (seen[k] < cutoff) delete seen[k];
+      chrome.storage.local.set({ [TAIL_STATS_KEY]: stats, [TAIL_SEEN_KEY]: seen }, () =>
+        resolve({ counted: true, day })
+      );
+    });
+  });
+}
+
 if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || typeof msg !== 'object') return undefined;
 
     // 页面问"我是那个后台执行器吗"。用 sender.tab.id 比,不靠页面自己声称。
+    if (msg.type === 'xf:tailConfirmed') {
+      // 串行化:两次事件不会并发读改写(互斥放这里是真的互斥 —— SW 唯一实例)
+      tailWriteChain = tailWriteChain.then(() => recordTailConfirmed(msg));
+      tailWriteChain.then((res) => {
+        try {
+          sendResponse(res);
+        } catch {
+          /* 页面可能已经关了,不影响计数 */
+        }
+      });
+      return true;
+    }
     if (msg.type === 'xf:whoami') {
       const tabId = sender && sender.tab ? sender.tab.id : null;
       isWorkerTab(tabId)
@@ -620,5 +676,11 @@ if (typeof chrome !== 'undefined' && chrome.action && chrome.action.onClicked) {
 // 供测试直接验证调度判断。service worker 本身没法在 node 里跑起来,
 // 但这几个纯函数是"能不能开始"的全部依据,值得单独钉住。
 if (typeof module === 'object' && module.exports) {
-  module.exports = { isInFlight, isSettled, idleExpired, MIN_GAP_MS, JOB_TIMEOUT_MS, IDLE_KEEP_MS };
+  module.exports = {
+    isInFlight, isSettled, idleExpired, MIN_GAP_MS, JOB_TIMEOUT_MS, IDLE_KEEP_MS,
+    // 一起导出:**"SW 不能 importScripts"对运行时成立、对测试不成立**(外部评审原话)。
+    // 不挂出来,后台那半段(去重/事件日/缺 id 拒收)就只有一条"源码比对"的半摆设测试兜着:
+    // 把后台的事件日改成 Date.now()、或删掉缺 id 拒收,335 条照样全绿。
+    recordTailConfirmed,
+  };
 }
